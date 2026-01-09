@@ -1,0 +1,552 @@
+1 <!DOCTYPE html>
+2 <html lang="en">
+3 <head>
+4   <meta charset="UTF-8">
+5   <title>Rhythm Game PWA</title>
+6 <link rel="icon" href="icon-32.png" type="image/png">
+7
+8   <!-- スマホ最適化 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+
+  <!-- iOS フルスクリーン化 -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <link rel="manifest" href="manifest.json">
+
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: white;
+      font-family: sans-serif;
+      text-align: center;
+      overflow: hidden;
+      height: calc(var(--vh, 1vh) * 100);
+    }
+
+    #menu, #game, #result { margin-top: 20px; }
+
+    canvas {
+      background: #111;
+      display: block;
+      margin: 10px auto;
+      touch-action: none;
+      max-width: 100vw;
+      height: calc(var(--vh, 1vh) * 80);
+    }
+
+    button {
+      padding: 10px 18px;
+      margin: 6px;
+      font-size: 18px;
+      border-radius: 8px;
+    }
+  </style>
+
+  <script>
+    // iOS の 100vh 問題対策
+    function fixMobileHeight() {
+      const vh = window.innerHeight * 0.01;
+      document.documentElement.style.setProperty('--vh', `${vh}px`);
+    }
+    window.addEventListener('resize', fixMobileHeight);
+    window.addEventListener('orientationchange', fixMobileHeight);
+    fixMobileHeight();
+  </script>
+</head>
+
+<body>
+
+<!-- MENU -->
+<div id="menu">
+  <h2>Select Song & Difficulty</h2>
+  <div id="songList"></div>
+
+  <!-- スマホ用：自然な終了ボタン -->
+  <button onclick="exitGame()" style="margin-top:20px; background:#333; color:white;">
+    ゲームを終了
+  </button>
+
+  <p>PC: S / D / K / L | Mobile: Tap the lanes</p>
+</div>
+
+<!-- GAME -->
+<div id="game" style="display:none;">
+  <h2 id="songTitle"></h2>
+  <canvas id="canvas"></canvas>
+  <p id="info"></p>
+</div>
+
+<!-- RESULT -->
+<div id="result" style="display:none;">
+  <h2>Result</h2>
+  <p id="finalScore"></p>
+  <p id="finalCombo"></p>
+  <p id="finalJudge"></p>
+  <button onclick="returnToMenu()">Back to Menu</button>
+</div>
+
+<script>
+/* ============================================================
+   CANVAS SETUP
+============================================================ */
+function isMobileDevice() {
+  return /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+}
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+canvas.width = 400;
+canvas.height = 600;
+
+if (isMobileDevice()) {
+  canvas.style.width = "100%";
+} else {
+  canvas.style.width = "350px";
+  canvas.style.height = "525px";
+}
+
+/* ============================================================
+   SOUND EFFECTS
+============================================================ */
+const seClick = new Audio("se/click.mp3");
+seClick.volume = 0.35;
+
+/* ============================================================
+   SONG LIST LOADING
+============================================================ */
+let songs = [];
+
+async function loadSongList() {
+  const res = await fetch("notes/list.json");
+  songs = await res.json();
+}
+
+/* ============================================================
+   MENU GENERATION
+============================================================ */
+function buildSongMenu() {
+  const list = document.getElementById("songList");
+  list.innerHTML = "";
+
+  songs.forEach((song, index) => {
+    const div = document.createElement("div");
+    div.innerHTML = `
+      <button onclick="startGame(${index}, 'easy')">${song.title} (Easy)</button>
+      <button onclick="startGame(${index}, 'hard')">${song.title} (Hard)</button>
+    `;
+    list.appendChild(div);
+  });
+}
+
+/* ============================================================
+   GAME VARIABLES
+============================================================ */
+let notes = [];
+let internalMarkers = [];
+let bpmCurrent = 120;
+
+let startTime = 0;
+let score = 0, combo = 0, maxCombo = 0;
+let judgeCount = { Perfect: 0, Good: 0, Miss: 0 };
+let lastJudgment = "", lastJudgmentTimer = 0;
+
+let holdState = [null, null, null, null];
+let audio = null;
+
+const lanes = 4;
+const laneWidth = canvas.width / lanes;
+const hitY = 500;
+const travelTime = 2.0;
+const speed = (hitY + 50) / travelTime;
+
+const perfectWindow = 0.06;
+const goodWindow = 0.12;
+const missWindow = 0.18;
+
+const keyToLane = { s: 0, d: 1, k: 2, l: 3 };
+
+/* ============================================================
+   VISUAL EFFECTS
+============================================================ */
+let laneFlash = [
+  { alpha: 0, color: "white" },
+  { alpha: 0, color: "white" },
+  { alpha: 0, color: "white" },
+  { alpha: 0, color: "white" }
+];
+
+let explosions = [];
+let longGlowPhase = 0;
+
+/* ============================================================
+   INPUT HANDLING
+============================================================ */
+document.addEventListener("keydown", e => {
+  const key = e.key.toLowerCase();
+  if (keyToLane[key] !== undefined) handleKeyDown(keyToLane[key]);
+});
+
+document.addEventListener("keyup", e => {
+  const key = e.key.toLowerCase();
+  if (keyToLane[key] !== undefined) handleKeyUp(keyToLane[key]);
+});
+
+canvas.addEventListener("touchstart", e => {
+  e.preventDefault();
+  const rect = canvas.getBoundingClientRect();
+  const x = e.touches[0].clientX - rect.left;
+  const lane = Math.floor(x / laneWidth);
+  handleKeyDown(lane);
+});
+
+canvas.addEventListener("touchend", e => {
+  e.preventDefault();
+  handleTouchEnd();
+});
+
+/* ============================================================
+   START GAME
+============================================================ */
+async function startGame(songIndex, difficulty) {
+  document.getElementById("menu").style.display = "none";
+  document.getElementById("result").style.display = "none";
+  document.getElementById("game").style.display = "block";
+
+  const song = songs[songIndex];
+  document.getElementById("songTitle").innerText =
+    `${song.title} [${difficulty.toUpperCase()}]`;
+
+  const res = await fetch(song.json);
+  const chart = await res.json();
+
+  bpmCurrent = chart.bpm;
+
+  const pattern = chart.patterns[difficulty];
+  const markers = chart.patterns.internalMarkers || [];
+
+  notes = pattern.map(n => ({
+    lane: n.lane,
+    time: n.beat * 60 / bpmCurrent,
+    hitTime: n.beat * 60 / bpmCurrent + travelTime,
+    endTime: n.endBeat ? n.endBeat * 60 / bpmCurrent : null,
+    endHitTime: n.endBeat ? n.endBeat * 60 / bpmCurrent + travelTime : null,
+    type: n.type,
+    judged: false,
+    glow: 0,
+    active: false
+  }));
+
+  internalMarkers = markers.map(m => ({
+    beat: m.beat,
+    time: m.beat * 60 / bpmCurrent,
+    hitTime: m.beat * 60 / bpmCurrent + travelTime
+  }));
+
+  score = 0;
+  combo = 0;
+  maxCombo = 0;
+  judgeCount = { Perfect: 0, Good: 0, Miss: 0 };
+  lastJudgment = "";
+  lastJudgmentTimer = 0;
+  holdState = [null, null, null, null];
+
+  audio = new Audio(song.audio);
+  audio.play();
+
+  startTime = performance.now() / 1000;
+  update();
+}
+
+/* ============================================================
+   JUDGMENT
+============================================================ */
+function judge(diff) {
+  const ad = Math.abs(diff);
+  if (ad <= perfectWindow) return "Perfect";
+  if (ad <= goodWindow) return "Good";
+  if (ad <= missWindow) return "Miss";
+  return null;
+}
+
+function applyJudgment(note, result) {
+  if (!result || note.judged) return;
+
+  note.judged = true;
+  note.glow = 0.2;
+
+  judgeCount[result]++;
+  if (result === "Perfect") { score += 1000; combo++; }
+  else if (result === "Good") { score += 500; combo++; }
+  else combo = 0;
+
+  if (combo > maxCombo) maxCombo = combo;
+
+  lastJudgment = result;
+  lastJudgmentTimer = 0.5;
+
+  laneFlash[note.lane].alpha = 0.6;
+  laneFlash[note.lane].color =
+    result === "Perfect" ? "deepskyblue" :
+    result === "Good" ? "lime" : "red";
+
+  explosions.push({
+    x: note.lane * laneWidth + laneWidth / 2,
+    y: hitY,
+    radius: 5,
+    alpha: 1,
+    color: laneFlash[note.lane].color
+  });
+
+  seClick.currentTime = 0;
+  seClick.volume =
+    result === "Perfect" ? 0.45 :
+    result === "Good" ? 0.35 : 0.25;
+  seClick.play();
+}
+
+/* ============================================================
+   INPUT PROCESSING
+============================================================ */
+function handleKeyDown(lane) {
+  const t = performance.now() / 1000 - startTime;
+
+  let candidate = null;
+  let minDiff = Infinity;
+
+  for (let n of notes) {
+    if (n.lane !== lane || n.judged) continue;
+    const diff = t - n.hitTime;
+    if (Math.abs(diff) < minDiff) {
+      minDiff = Math.abs(diff);
+      candidate = n;
+    }
+  }
+
+  if (!candidate) return;
+
+  const result = judge(t - candidate.hitTime);
+  if (!result) return;
+
+  if (candidate.type === "tap") {
+    applyJudgment(candidate, result);
+  } else {
+    candidate.active = true;
+    holdState[lane] = candidate;
+  }
+}
+
+function handleKeyUp(lane) {
+  const note = holdState[lane];
+  if (!note) return;
+
+  const t = performance.now() / 1000 - startTime;
+  const result = judge(t - note.endHitTime);
+
+  applyJudgment(note, result || "Miss");
+  note.active = false;
+  holdState[lane] = null;
+}
+
+function handleTouchEnd() {
+  const t = performance.now() / 1000 - startTime;
+  for (let lane = 0; lane < 4; lane++) {
+    const note = holdState[lane];
+    if (!note) continue;
+    const result = judge(t - note.endHitTime);
+    applyJudgment(note, result || "Miss");
+    note.active = false;
+    holdState[lane] = null;
+  }
+}
+
+/* ============================================================
+   END CHECK
+============================================================ */
+function checkEnd(t) {
+  let lastEnd = 0;
+
+  for (let n of notes) {
+    const end = n.type === "long" ? n.endHitTime : n.hitTime;
+    if (end > lastEnd) lastEnd = end;
+  }
+
+  for (let m of internalMarkers) {
+    if (m.hitTime > lastEnd) lastEnd = m.hitTime;
+  }
+
+  return t > lastEnd + 1.0;
+}
+
+/* ============================================================
+   MAIN LOOP
+============================================================ */
+function update() {
+  const now = performance.now() / 1000;
+  const t = now - startTime;
+
+  if (checkEnd(t)) {
+    showResult();
+    return;
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawBackground(t);
+
+  for (let i = 0; i < lanes; i++) {
+    ctx.fillStyle = "rgba(255,255,255,0.05)";
+    ctx.fillRect(i * laneWidth, 0, laneWidth - 2, canvas.height);
+  }
+
+  ctx.fillStyle = "yellow";
+  ctx.fillRect(0, hitY, canvas.width, 4);
+
+  longGlowPhase += 0.1;
+
+  for (let n of notes) {
+    const y = hitY - (n.hitTime - t) * speed;
+    const x = n.lane * laneWidth + 10;
+    let w = laneWidth - 20;
+
+    if (!n.judged) {
+      if (n.type === "tap" && t - n.hitTime > missWindow) applyJudgment(n, "Miss");
+      if (n.type === "long" && t - n.endHitTime > missWindow) applyJudgment(n, "Miss");
+    }
+
+    if (n.type === "tap") {
+      ctx.fillStyle = n.glow > 0 ? "white" : "cyan";
+      ctx.fillRect(x, y - 10, w, 20);
+    }
+
+    if (n.type === "long") {
+      const y2 = hitY - (n.endHitTime - t) * speed;
+      const top = Math.min(y, y2);
+      const h = Math.max(20, Math.abs(y - y2));
+
+      if (n.active) {
+        ctx.fillStyle = "#66ffcc";
+        w = laneWidth - 14;
+      } else {
+        ctx.fillStyle = "lime";
+      }
+
+      ctx.fillRect(x, top, w, h);
+
+      if (n.active) {
+        const glowY = top + (Math.sin(longGlowPhase) * 0.5 + 0.5) * h;
+        ctx.fillStyle = "rgba(255,255,255,0.35)";
+        ctx.fillRect(x, glowY - 4, w, 8);
+      }
+    }
+
+    if (n.glow > 0) n.glow -= 1 / 60;
+  }
+
+  for (let i = 0; i < 4; i++) {
+    if (laneFlash[i].alpha > 0) {
+      ctx.fillStyle = laneFlash[i].color;
+      ctx.globalAlpha = laneFlash[i].alpha;
+      ctx.fillRect(i * laneWidth, 0, laneWidth, canvas.height);
+      ctx.globalAlpha = 1.0;
+      laneFlash[i].alpha -= 0.05;
+    }
+  }
+
+  for (let e of explosions) {
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, e.radius, 0, Math.PI * 2);
+    ctx.strokeStyle = e.color;
+    ctx.globalAlpha = e.alpha;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.globalAlpha = 1.0;
+
+    e.radius += 2;
+    e.alpha -= 0.08;
+  }
+  explosions = explosions.filter(e => e.alpha > 0);
+
+  ctx.fillStyle = "white";
+  ctx.font = "18px sans-serif";
+  ctx.fillText("Score: " + score, 10, 25);
+  ctx.fillText("Combo: " + combo, 10, 50);
+
+  if (lastJudgmentTimer > 0) {
+    lastJudgmentTimer -= 1 / 60;
+    let color =
+      lastJudgment === "Perfect" ? "deepskyblue" :
+      lastJudgment === "Good" ? "lime" : "red";
+
+    ctx.fillStyle = color;
+    ctx.font = "32px sans-serif";
+    ctx.fillText(lastJudgment, canvas.width / 2 - 60, hitY - 40);
+  }
+
+  document.getElementById("info").innerText =
+    `Score: ${score} / Combo: ${combo} / Max Combo: ${maxCombo}`;
+
+  requestAnimationFrame(update);
+}
+
+/* ============================================================
+   BACKGROUND
+============================================================ */
+function drawBackground(t) {
+  const grad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+  grad.addColorStop(0, "#001");
+  grad.addColorStop(1, "#113");
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  for (let i = 0; i < 10; i++) {
+    const y = (t * 50 + i * 60) % (canvas.height + 60) - 60;
+    ctx.fillStyle = "rgba(0,150,255,0.15)";
+    ctx.fillRect(0, y, canvas.width, 20);
+  }
+}
+
+/* ============================================================
+   RESULT
+============================================================ */
+function showResult() {
+  document.getElementById("game").style.display = "none";
+  document.getElementById("result").style.display = "block";
+
+  document.getElementById("finalScore").innerText = "Score: " + score;
+  document.getElementById("finalCombo").innerText = "Max Combo: " + maxCombo;
+  document.getElementById("finalJudge").innerText =
+    `Perfect: ${judgeCount.Perfect} / Good: ${judgeCount.Good} / Miss: ${judgeCount.Miss}`;
+}
+
+/* ============================================================
+   RETURN TO MENU
+============================================================ */
+function returnToMenu() {
+  document.getElementById("result").style.display = "none";
+  document.getElementById("menu").style.display = "block";
+}
+
+/* ============================================================
+   EXIT GAME（スマホ用）
+============================================================ */
+function exitGame() {
+  if (window.matchMedia('(display-mode: standalone)').matches) {
+    window.close();
+    return;
+  }
+  location.href = "about:blank";
+}
+
+/* ============================================================
+   INIT
+============================================================ */
+window.onload = async function() {
+  await loadSongList();
+  buildSongMenu();
+};
+</script>
+
+</body>
+</html>
